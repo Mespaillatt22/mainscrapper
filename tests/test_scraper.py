@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 
 from scraper import (
     BusinessContact,
+    _candidate_pages,
     generic_email,
     host_is_public,
     normalize_phone,
@@ -68,6 +69,28 @@ class ScraperHelpersTests(unittest.TestCase):
             parse_contact_page(html),
             ("Acme Plumbing", "info@acme.example", "+15552345678"),
         )
+
+    def test_discovers_contact_links_from_homepage_and_ignores_external_links(self):
+        html = """
+            <a href="/contact-us">Contact</a>
+            <a href="/our-team">Meet the team</a>
+            <a href="https://other.example/contact">Contact elsewhere</a>
+            <a href="/products">Products</a>
+        """
+        pages = _candidate_pages("https://example.com", html)
+        self.assertEqual(pages[0], "https://example.com/")
+        self.assertIn("https://example.com/contact-us", pages)
+        self.assertIn("https://example.com/our-team", pages)
+        self.assertNotIn("https://other.example/contact", pages)
+        self.assertNotIn("https://example.com/products", pages)
+
+    def test_discovered_contact_links_are_deduplicated(self):
+        html = """
+            <a href="/contact">Contact</a>
+            <a href="/contact">Contact us</a>
+        """
+        pages = _candidate_pages("https://example.com", html)
+        self.assertEqual(pages.count("https://example.com/contact"), 1)
 
     def test_appends_only_new_contacts_and_keeps_existing_rows(self):
         with TemporaryDirectory() as directory:
