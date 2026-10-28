@@ -142,12 +142,18 @@ def host_is_public(host: str) -> bool:
     return bool(addresses) and all(address.is_global for address in addresses)
 
 
-def generic_email(value: str) -> str:
-    email = value.strip().strip(".,;:()[]<>\"'").lower()
-    if "@" not in email:
+def public_email(value: str) -> str:
+    """Normalize a publicly listed email and reject obvious automated addresses."""
+    email = value.strip()
+    if email.lower().startswith("mailto:"):
+        email = unquote(email[7:].split("?", 1)[0])
+    email = email.strip().strip(".,;:()[]<>\"'").lower()
+    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", email):
         return ""
-    local, _ = email.rsplit("@", 1)
-    return email if local.split("+", 1)[0].replace(".", "").replace("_", "").replace("-", "") in GENERIC_EMAIL_NAMES else ""
+    local = email.rsplit("@", 1)[0]
+    normalized_local = re.sub(r"[^a-z0-9]", "", local.split("+", 1)[0])
+    blocked_names = {"noreply", "donotreply", "mailerdaemon", "postmaster"}
+    return "" if normalized_local in blocked_names else email
 
 
 def normalize_phone(value: str) -> str:
@@ -165,7 +171,7 @@ def parse_contact_page(html: str) -> tuple[str, str, str]:
     email_candidates = parser.emails + EMAIL_RE.findall(visible_text)
     phone_candidates = parser.phones + PHONE_RE.findall(visible_text)
     title = parser.site_name or " ".join(parser.title_parts).strip()
-    email = next((found for value in email_candidates if (found := generic_email(value))), "")
+    email = next((found for value in email_candidates if (found := public_email(value))), "")
     phone = next((found for value in phone_candidates if (found := normalize_phone(value))), "")
     return title, email, phone
 
