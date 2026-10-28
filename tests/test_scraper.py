@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 from scraper import (
     BusinessContact,
     _candidate_pages,
-    generic_email,
+    public_email,
     host_is_public,
     normalize_phone,
     normalize_website,
@@ -48,10 +48,15 @@ class ScraperHelpersTests(unittest.TestCase):
     def test_private_hosts_are_not_public(self):
         self.assertFalse(host_is_public("127.0.0.1"))
 
-    def test_only_accepts_generic_company_emails(self):
-        self.assertEqual(generic_email("mailto:info@example.com"), "")
-        self.assertEqual(generic_email(" Info+sales@example.com "), "info+sales@example.com")
-        self.assertEqual(generic_email("jane.doe@example.com"), "")
+    def test_accepts_public_generic_and_named_business_emails(self):
+        self.assertEqual(public_email("mailto:info@example.com?subject=Hello"), "info@example.com")
+        self.assertEqual(public_email(" Info+sales@example.com "), "info+sales@example.com")
+        self.assertEqual(public_email("jane.doe@example.com"), "jane.doe@example.com")
+
+    def test_rejects_obvious_automated_email_addresses(self):
+        self.assertEqual(public_email("no-reply@example.com"), "")
+        self.assertEqual(public_email("donotreply@example.com"), "")
+        self.assertEqual(public_email("not-an-email"), "")
 
     def test_normalizes_business_phone_numbers(self):
         self.assertEqual(normalize_phone("+1 (555) 234-5678"), "+15552345678")
