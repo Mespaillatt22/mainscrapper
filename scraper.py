@@ -22,7 +22,7 @@ from urllib.robotparser import RobotFileParser
 USER_AGENT = "BusinessContactCollector/1.0"
 MAX_PAGE_BYTES = 1_000_000
 MIN_REQUEST_INTERVAL = 2.0
-CONTACT_PATHS = ("/", "/contact", "/contact-us", "/about", "/about-us")
+CONTACT_PATHS = ("/", "/contact", "/contact-us", "/contactus", "/about", "/about-us", "/about-us/", "/our-team", "/team", "/leadership")
 GENERIC_EMAIL_NAMES = {
     "admin",
     "bookings",
@@ -51,6 +51,8 @@ class ContactPageParser(HTMLParser):
         self.phones: list[str] = []
         self.text_parts: list[str] = []
         self._in_title = False
+        self.links: list[tuple[str, str]] = []
+        self._current_link: int | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {key.lower(): value or "" for key, value in attrs}
@@ -60,6 +62,9 @@ class ContactPageParser(HTMLParser):
             self.site_name = attributes.get("content", "").strip()
         if tag.lower() == "a":
             href = attributes.get("href", "").strip()
+            if href:
+                self.links.append((href, ""))
+                self._current_link = len(self.links) - 1
             if href.lower().startswith("mailto:"):
                 self.emails.append(unquote(href[7:].split("?", 1)[0]))
             elif href.lower().startswith("tel:"):
@@ -68,19 +73,31 @@ class ContactPageParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "title":
             self._in_title = False
+        elif tag.lower() == "a":
+            self._current_link = None
 
     def handle_data(self, data: str) -> None:
         if self._in_title:
             self.title_parts.append(data)
         self.text_parts.append(data)
+        if self._current_link is not None:
+            href, label = self.links[self._current_link]
+            self.links[self._current_link] = (href, label + " " + data)
 
 
 class SameHostRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        source_host = urlsplit(req.full_url).hostname
-        target_host = urlsplit(newurl).hostname
-        if not source_host or target_host != source_host:
-            raise HTTPError(newurl, code, "Cross-host redirect blocked", headers, fp)
+        source_host = (urlsplit(req.full_url).hostname or "").lower().removeprefix("www.")
+        target = urlsplit(newurl)
+        target_host = (target.hostname or "").lower().removeprefix("www.")
+        if (
+            target.scheme not in {"http", "https"}
+            or not source_host
+            or target_host != source_host
+            or not target.hostname
+            or not host_is_public(target.hostname)
+        ):
+            raise HTTPError(newurl, code, "Redirect to a different or non-public host blocked", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -185,6 +202,48 @@ def load_robots(opener, origin: str) -> RobotFileParser | None:
     return parser
 
 
+def _canonical_host(host: str) -> str:
+    return host.lower().removeprefix("www.").rstrip(".")
+
+
+def _contact_link_score(href: str, label: str) -> int:
+    text = f"{href} {label}".casefold()
+    keywords = {
+        "contact": 10, "about": 8, "team": 7, "leadership": 7,
+        "owner": 7, "staff": 6, "management": 6, "company": 4,
+    }
+    return sum(weight for keyword, weight in keywords.items() if keyword in text)
+
+
+def _candidate_pages(origin: str, homepage_html: str) -> list[str]:
+    """Prioritize same-site contact/about/team links, then try common paths."""
+    parser = ContactPageParser()
+    parser.feed(homepage_html)
+    origin_host = urlsplit(origin).hostname or ""
+    discovered: list[tuple[int, str]] = []
+    seen: set[str] = {urljoin(origin, "/")}
+    for href, label in parser.links:
+        absolute = urljoin(origin + "/", href)
+        parts = urlsplit(absolute)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            continue
+        if _canonical_host(parts.hostname) != _canonical_host(origin_host):
+            continue
+        if _contact_link_score(href, label) <= 0:
+            continue
+        candidate = urlunsplit((parts.scheme, parts.netloc, parts.path or "/", "", ""))
+        if candidate not in seen:
+            discovered.append((_contact_link_score(href, label), candidate))
+            seen.add(candidate)
+    discovered.sort(key=lambda item: (-item[0], item[1]))
+    for path in CONTACT_PATHS[1:]:
+        candidate = urljoin(origin, path)
+        if candidate not in seen:
+            discovered.append((0, candidate))
+            seen.add(candidate)
+    return [urljoin(origin, "/")] + [url for _, url in discovered]
+
+
 def scrape_website(website: str) -> BusinessContact:
     contact = BusinessContact(
         website=website,
@@ -203,8 +262,15 @@ def scrape_website(website: str) -> BusinessContact:
         return contact
 
     last_request = 0.0
-    for path in CONTACT_PATHS:
-        page_url = urljoin(origin, path)
+    candidates = [urljoin(origin, "/")]
+    seen: set[str] = set()
+    index = 0
+    while index < len(candidates):
+        page_url = candidates[index]
+        index += 1
+        if page_url in seen:
+            continue
+        seen.add(page_url)
         if not robots.can_fetch(USER_AGENT, page_url):
             continue
         delay = max(MIN_REQUEST_INTERVAL, robots.crawl_delay(USER_AGENT) or 0)
@@ -213,13 +279,20 @@ def scrape_website(website: str) -> BusinessContact:
             time.sleep(wait)
         try:
             html = fetch_html(opener, page_url)
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+        except HTTPError as error:
+            # Missing guessed pages are expected; forbidden pages are not retried.
+            if error.code not in {404, 410}:
+                print(f"Could not fetch {page_url}: {error}", file=sys.stderr)
+            last_request = time.monotonic()
+            continue
+        except (URLError, TimeoutError, OSError, ValueError) as error:
             print(f"Could not fetch {page_url}: {error}", file=sys.stderr)
             last_request = time.monotonic()
             continue
         last_request = time.monotonic()
         if html is None:
             continue
+
         title, email, phone = parse_contact_page(html)
         if not contact.company_name and title:
             contact.company_name = title
@@ -230,8 +303,13 @@ def scrape_website(website: str) -> BusinessContact:
             contact.phone = phone
             if not contact.source_url:
                 contact.source_url = page_url
-    return contact
 
+        # The homepage is the only page used to discover additional links.
+        if page_url == urljoin(origin, "/"):
+            for discovered_url in _candidate_pages(origin, html):
+                if discovered_url not in seen and discovered_url not in candidates:
+                    candidates.append(discovered_url)
+    return contact
 
 def read_websites(path: Path) -> list[str]:
     websites = []
